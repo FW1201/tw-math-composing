@@ -1,5 +1,7 @@
 # 臺灣 K–12 數學圖形與排版研究
 
+> **維護位置已移轉。** 自 v0.4.0 起，數學圖文與考卷技能在 [FW1201/tw-edu-skills](https://github.com/FW1201/tw-edu-skills/tree/main/tw-edu-math-composing) 發布，教案、學習單與簡報沿用套件原有技能。整併見 [PR #2](https://github.com/FW1201/tw-edu-skills/pull/2)。以下保留 v0.3.0 的歷史內容與研究入口。
+
 本專案提供 [tw-edu-math-composing](tw-edu-math-composing/SKILL.md) v0.3.0，一支面向臺灣數學教師、可由教材設計、數學圖文或排版輸出開始的 skill。首版以國小、國中、普通高中三套可列印教材驗收。老師可以提供一份已有的題目請它排版，也可以只要求角度圖、數線、統計圖或可編輯公式。
 
 把整個 `tw-edu-math-composing` 資料夾放在宿主的技能目錄即可使用。例：「使用 tw-edu-math-composing 製作一份國小四年級量角學習單，用黑白 A4 印，另附教師版。」所附 [輸出說明](tw-edu-math-composing/references/output.md) 含本機重製方法。可從 [三學段原創案例](tw-edu-math-composing/examples) 跑出 Word、PDF 與圖形來源。實測結果見 [首版驗收](research/v0.1-acceptance.md)。
