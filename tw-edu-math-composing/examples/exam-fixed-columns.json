@@ -47,7 +47,9 @@
           " × 6"
         ],
         "answer_blank": true
-      }
+      },
+      "subquestion": true,
+      "parent_heading": "分數乘法"
     },
     {
       "id": "B2",
@@ -67,7 +69,8 @@
           " × 5"
         ],
         "answer_blank": true
-      }
+      },
+      "subquestion": true
     },
     {
       "id": "B3",
@@ -87,7 +90,8 @@
           " × 2"
         ],
         "answer_blank": true
-      }
+      },
+      "subquestion": true
     },
     {
       "id": "C1",

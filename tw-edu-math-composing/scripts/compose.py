@@ -1,8 +1,10 @@
 """Compose a math worksheet from a version 1 source file."""
 import argparse
+from copy import deepcopy
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -68,7 +70,8 @@ def validate_parts(parts):
             raise ValueError(f"不支援的公式結構：{kind}")
 
 
-DEFAULT_FONT = "Noto Sans TC"
+DEFAULT_FONT = "Noto Serif TC"
+DEFAULT_FALLBACK = "Noto Sans TC"
 COLUMN_GAP_CM = 0.8
 
 
@@ -132,6 +135,60 @@ def layout_zones(source):
     if {zone["columns"] for zone in zones} != {1, 2}:
         raise ValueError("mixed 須同時有一欄及兩欄分區")
     return zones
+
+
+def chinese_number(number):
+    digits = "零一二三四五六七八九"
+    if number < 10:
+        return digits[number]
+    tens, ones = divmod(number, 10)
+    if tens > 9:
+        raise ValueError("單份教材最多 99 個大題")
+    return (digits[tens] if tens > 1 else "") + "十" + (digits[ones] if ones else "")
+
+
+def numbered_source(source):
+    """Derive display labels without replacing the source IDs or changing source text."""
+    result = deepcopy(source)
+    zones = {zone["start_item"]: zone for zone in layout_zones(result)}
+    items = result["items"]
+    if not zones and not items[0].get("group_heading"):
+        items[0]["group_heading"] = "圖示" if result["purpose"] == "數學圖文" else "練習題"
+    section = counter = child = 0
+    active_parent = False
+    for item in items:
+        zone = zones.get(item["id"])
+        if zone or item.get("group_heading"):
+            if zone and item.get("group_heading"):
+                raise ValueError("分區首題請在 zone.title 或 group_heading 擇一設定標題")
+            section += 1
+            counter = child = 0
+            active_parent = False
+            target, field = (zone, "title") if zone else (item, "group_heading")
+            text = re.sub(r"^(?:第[零一二三四五六七八九十]+部分[｜：:、 ]*|[零一二三四五六七八九十]+、)",
+                          "", target.get(field, "練習題"))
+            target[field] = f"{chinese_number(section)}、{text}"
+        parent = item.get("parent_heading")
+        subquestion = item.get("subquestion", False)
+        if parent is not None:
+            if not isinstance(parent, str) or not parent.strip() or subquestion is not True:
+                raise ValueError("parent_heading 須為非空文字，只填在第一個子題")
+            counter += 1
+            child = 0
+            active_parent = True
+            item["parent_heading"] = f"{counter}、{parent}"
+        if type(subquestion) is not bool:
+            raise ValueError("subquestion 須為布林值")
+        if subquestion:
+            if not active_parent:
+                raise ValueError(f'{item["id"]} 的子題缺少 parent_heading')
+            child += 1
+            item["display_number"] = f"（{child}）"
+        else:
+            active_parent = False
+            counter += 1
+            item["display_number"] = f"{counter}、"
+    return result
 
 
 def diagram(spec, svg_path=None, png_path=None, font_family=DEFAULT_FONT, font_file=None):
@@ -253,17 +310,19 @@ def validate(source):
         if "workspace_mm" in item:
             height = item["workspace_mm"]
             if type(height) is not int or not 5 <= height <= 90 or item.get("answer_lines"):
-                raise ValueError("作答留白須為 5 至 90 毫米的整數，與作答線擇一")
+                raise ValueError("workspace_mm 須為 5 至 90 毫米的整數，與 answer_lines 擇一")
+    numbered_source(source)
 
 
 def document(source, path, assets, teacher, font_family):
     from docx import Document
     from docx.enum.section import WD_SECTION_START
-    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Cm, Pt, RGBColor
 
+    source = numbered_source(source)
     doc = Document()
     section = doc.sections[0]
     section.page_width, section.page_height = Cm(21), Cm(29.7)
@@ -271,8 +330,9 @@ def document(source, path, assets, teacher, font_family):
     section.left_margin = section.right_margin = Cm(1.8)
     layout = source.get("layout", {})
     exam_header = layout.get("exam_header", False)
-    sizes = (10.5, 15, 11) if exam_header else (11, 24, 13)
-    for name, size in zip(("Normal", "Title", "Heading 2"), sizes):
+    styles = (("Normal", 10.5), ("Title", 15), ("Heading 1", 12),
+              ("Heading 2", 11), ("Heading 3", 10.5))
+    for name, size in styles:
         style = doc.styles[name]
         style.font.name = font_family
         fonts = style.element.get_or_add_rPr().rFonts
@@ -281,37 +341,48 @@ def document(source, path, assets, teacher, font_family):
         fonts.set(qn("w:eastAsia"), font_family)
         style.font.size = Pt(size)
         style.font.color.rgb = RGBColor.from_string("202020")
-    if "layout" in source:
-        normal = doc.styles["Normal"].paragraph_format
-        normal.space_after = Pt(3)
-        normal.line_spacing = Pt(15)
-        heading_style = doc.styles["Heading 2"].paragraph_format
-        heading_style.space_before = Pt(6)
+    normal = doc.styles["Normal"].paragraph_format
+    normal.space_after = Pt(3)
+    normal.line_spacing = Pt(15)
+    for level in (1, 2, 3):
+        heading_style = doc.styles[f"Heading {level}"].paragraph_format
+        heading_style.space_before = Pt(5 if level == 1 else 4)
         heading_style.space_after = Pt(2)
         heading_style.line_spacing = Pt(17)
-        grid = section._sectPr.find(qn("w:docGrid"))
-        if grid is not None:
-            section._sectPr.remove(grid)
-    if exam_header:
-        title = doc.add_heading(source["title"], 0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        border = OxmlElement("w:pBdr")
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "nil")
-        border.append(bottom)
-        title._p.get_or_add_pPr().append(border)
-        identity = (f'{source["stage"]}　｜　教師版' if teacher else
-                    "學校 __________　____ 年 ____ 班　座號 ____　姓名 __________________")
-        doc.add_paragraph(identity).alignment = WD_ALIGN_PARAGRAPH.CENTER
-    else:
-        doc.add_heading(source["title"], 0)
-        doc.add_paragraph(f'{source["stage"]}　｜　{source["purpose"]}　｜　' + ("教師版" if teacher else "學生版"))
-        if not teacher:
-            doc.add_paragraph("班級 __________　姓名 __________　日期 __________")
+        heading_style.keep_with_next = True
+    grid = section._sectPr.find(qn("w:docGrid"))
+    if grid is not None:
+        section._sectPr.remove(grid)
+    title = doc.add_heading(source["title"], 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(4)
+    border = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "nil")
+    border.append(bottom)
+    title._p.get_or_add_pPr().append(border)
+
+    graphic = source["purpose"] == "數學圖文"
+    role = ("授課用圖" if teacher else "圖文預覽") if graphic else ("教師版" if teacher else "學生版")
+    meta = doc.add_paragraph(f'{source["stage"]}　｜　{role}')
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.paragraph_format.space_after = Pt(5)
+    for run in meta.runs:
+        run.font.size = Pt(9)
+    if not teacher and not graphic:
+        fields = "____ 年 ____ 班　　座號 ____　　姓名 ______________"
+        if exam_header:
+            fields = "學校 ________　　" + fields
+        identity = doc.add_paragraph(fields)
+        identity.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        identity.paragraph_format.space_after = Pt(8)
+        for run in identity.runs:
+            run.font.size = Pt(9)
+
     mode = layout.get("mode", "single")
     zones = {zone["start_item"]: zone for zone in layout_zones(source)}
     columns = 1
-    question_gap = layout.get("question_gap_pt", 10 if exam_header else 8)
+    question_gap = layout.get("question_gap_pt", 10)
 
     def switch_columns(count, page_break=False):
         nonlocal columns
@@ -334,7 +405,7 @@ def document(source, path, assets, teacher, font_family):
         if zone and zone.get("title"):
             if columns != 1 or page_break:
                 switch_columns(1, page_break)
-            heading = doc.add_heading(zone["title"], level=2)
+            heading = doc.add_heading(zone["title"], level=1)
             if desired != 1:
                 # The heading precedes the section break, so it spans the full page.
                 heading.paragraph_format.keep_with_next = False
@@ -348,20 +419,28 @@ def document(source, path, assets, teacher, font_family):
             marker.paragraph_format.line_spacing = Pt(1)
             marker.add_run().add_break(WD_BREAK.COLUMN)
         if item.get("group_heading"):
-            group = doc.add_heading(item["group_heading"], level=2)
+            group = doc.add_heading(item["group_heading"], level=1)
             group.paragraph_format.page_break_before = page_break
             if separate:
                 group.paragraph_format.space_before = Pt(question_gap)
-            if exam_header:
-                for run in group.runs:
-                    run.font.size = Pt(11.5)
+            page_break = False
+        subquestion = bool(item.get("subquestion"))
+        if item.get("parent_heading"):
+            parent = doc.add_heading(item["parent_heading"], level=2)
+            parent.paragraph_format.page_break_before = page_break
+            if separate and not item.get("group_heading"):
+                parent.paragraph_format.space_before = Pt(question_gap)
             page_break = False
         heading_text = item.get("heading", "練習")
-        heading = doc.add_heading(item["id"] + (f"　{heading_text}" if heading_text else ""), level=2)
+        label = item.get("display_number", item["id"])
+        separator = " " if subquestion else ""
+        heading = doc.add_heading(label + (separator + heading_text if heading_text else ""),
+                                  level=3 if subquestion else 2)
         heading.paragraph_format.page_break_before = page_break
-        if separate and not item.get("group_heading"):
+        if separate and not item.get("group_heading") and not item.get("parent_heading"):
             heading.paragraph_format.space_before = Pt(question_gap)
-        content_cm = (17.4 - COLUMN_GAP_CM * (columns - 1)) / columns
+        content_cm = (17.4 - COLUMN_GAP_CM * (columns - 1)) / columns - (0.4 if subquestion else 0)
+        first_paragraph = len(doc.paragraphs) - 1
         prompt = doc.add_paragraph(item["prompt"])
         prompt.paragraph_format.keep_together = True
         following_answer = bool(item.get("answer") if teacher else
@@ -375,8 +454,6 @@ def document(source, path, assets, teacher, font_family):
             formula = item["formula"]
             parts = formula["parts"] + ([" ="] if formula.get("answer_blank") else [])
             math_paragraph._p.append(native_math(parts))
-            if formula.get("answer_blank"):
-                math_paragraph.add_run(" ________")
             math_paragraph.paragraph_format.keep_with_next = (
                 any(key in item for key in ("figure", "table")) or following_answer
             )
@@ -396,23 +473,38 @@ def document(source, path, assets, teacher, font_family):
             for row_index, row in enumerate(rows):
                 for cell, data in zip(table.add_row().cells, row):
                     cell.text = str(data)
+                    if row_index == 0:
+                        shading = OxmlElement("w:shd")
+                        shading.set(qn("w:fill"), "EEEEEE")
+                        cell._tc.get_or_add_tcPr().append(shading)
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
                     cell.paragraphs[0].paragraph_format.keep_with_next = (
                         row_index + 1 < len(rows)
                         or following_answer
                     )
         if teacher and item.get("answer"):
-            doc.add_paragraph(item["answer"])
-        elif not teacher and item.get("workspace_mm"):
-            space = doc.add_paragraph()
-            space.paragraph_format.line_spacing = Cm(item["workspace_mm"] / 10)
-            space.paragraph_format.space_after = Pt(0)
+            teacher_note = doc.add_paragraph()
+            teacher_note.paragraph_format.space_before = Pt(3)
+            teacher_note.paragraph_format.left_indent = Cm(0.2)
+            teacher_note.paragraph_format.keep_together = True
+            label, delimiter, answer = item["answer"].partition("｜")
+            if delimiter and label in ("解答", "原稿附答"):
+                teacher_note.add_run("解析｜").bold = True
+                teacher_note.add_run(answer)
+            else:
+                teacher_note.add_run("解析｜").bold = True
+                teacher_note.add_run(item["answer"])
         elif not teacher:
-            answer_lines = item.get("answer_lines", 0)
-            for index in range(answer_lines):
-                paragraph = doc.add_paragraph("\t")
-                paragraph.paragraph_format.keep_with_next = index + 1 < answer_lines
-                paragraph.paragraph_format.tab_stops.add_tab_stop(
-                    Cm(content_cm - 0.2), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.LINES)
+            blank_mm = item.get("workspace_mm", 6 * item.get("answer_lines", 0))
+            if blank_mm:
+                space = doc.add_paragraph()
+                space.paragraph_format.line_spacing = Cm(blank_mm / 10)
+                space.paragraph_format.space_before = Pt(0)
+                space.paragraph_format.space_after = Pt(0)
+        if subquestion:
+            for paragraph in doc.paragraphs[first_paragraph:]:
+                paragraph.paragraph_format.left_indent = Cm(0.4)
     doc.save(path)
 
 
@@ -441,7 +533,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     layout = source.get("layout", {})
     requested = layout.get("font_family", DEFAULT_FONT).strip()
-    fallback = layout.get("fallback_font_family", DEFAULT_FONT).strip()
+    fallback = layout.get("fallback_font_family", DEFAULT_FALLBACK).strip()
     font_family, font_file, font_note, resolved = resolve_font(requested, fallback)
     if font_note:
         print(font_note, file=sys.stderr)
@@ -449,7 +541,7 @@ def main():
               "local_font_confirmed": resolved, "font_note": font_note,
               "layout_mode": layout.get("mode", "single"),
               "column_rule": layout.get("column_rule", False),
-              "question_gap_pt": layout.get("question_gap_pt", 10 if layout.get("exam_header") else 8)}
+              "question_gap_pt": layout.get("question_gap_pt", 10)}
     for item in source["items"]:
         if "figure" in item:
             basename = out / item["id"]
@@ -461,7 +553,7 @@ def main():
     student = {key: source[key] for key in ("version", "title", "stage", "purpose", "sources", "layout") if key in source}
     student["items"] = [{key: value for key, value in item.items() if key in (
         "id", "heading", "prompt", "figure", "formula", "table", "answer_lines", "page_break",
-        "column_break", "group_heading", "workspace_mm"
+        "column_break", "group_heading", "workspace_mm", "subquestion", "parent_heading"
     )} for item in source["items"]]
     student_file = out / "student.docx"
     teacher_file = out / "teacher.docx"
