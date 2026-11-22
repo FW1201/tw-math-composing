@@ -101,6 +101,9 @@ def layout_zones(source):
         if key in settings and (not isinstance(settings[key], str) or not settings[key].strip()
                                 or any(c in settings[key] for c in "\n\r\t")):
             raise ValueError(f"layout.{key} 必須為單行字型名稱")
+    for key in ("column_rule", "exam_header"):
+        if key in settings and type(settings[key]) is not bool:
+            raise ValueError(f"layout.{key} 須為布林值")
     zones = settings.get("zones", [])
     if mode != "mixed":
         if zones:
@@ -223,13 +226,30 @@ def validate(source):
             raise ValueError("作答行數須介於 0 到 12")
     if not ids:
         raise ValueError("教材至少須有一題")
-    layout_zones(source)
+    zones = {zone["start_item"]: zone for zone in layout_zones(source)}
+    columns = 2 if source.get("layout", {}).get("mode") == "double" else 1
+    for index, item in enumerate(source["items"]):
+        zone = zones.get(item["id"])
+        if zone:
+            columns = zone["columns"]
+        if "column_break" in item and type(item["column_break"]) is not bool:
+            raise ValueError("column_break 須為布林值")
+        if item.get("column_break") and (columns != 2 or index == 0 or zone or item.get("page_break")):
+            raise ValueError("換欄須位於雙欄區內，且不可與區首或換頁同時使用")
+        if "group_heading" in item and (not isinstance(item["group_heading"], str)
+                                        or not item["group_heading"].strip()):
+            raise ValueError("題區標題須為非空文字")
+        if "workspace_mm" in item:
+            height = item["workspace_mm"]
+            if type(height) is not int or not 5 <= height <= 90 or item.get("answer_lines"):
+                raise ValueError("作答留白須為 5 至 90 毫米的整數，與作答線擇一")
 
 
 def document(source, path, assets, teacher, font_family):
     from docx import Document
     from docx.enum.section import WD_SECTION_START
-    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Cm, Pt, RGBColor
 
@@ -258,11 +278,26 @@ def document(source, path, assets, teacher, font_family):
         grid = section._sectPr.find(qn("w:docGrid"))
         if grid is not None:
             section._sectPr.remove(grid)
-    doc.add_heading(source["title"], 0)
-    doc.add_paragraph(f'{source["stage"]}　｜　{source["purpose"]}　｜　' + ("教師版" if teacher else "學生版"))
-    if not teacher:
-        doc.add_paragraph("班級 __________　姓名 __________　日期 __________")
-    mode = source.get("layout", {}).get("mode", "single")
+    layout = source.get("layout", {})
+    if layout.get("exam_header"):
+        title = doc.add_heading(source["title"], 0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        border = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "nil")
+        border.append(bottom)
+        title._p.get_or_add_pPr().append(border)
+        for run in title.runs:
+            run.font.size = Pt(18)
+        identity = (f'{source["stage"]}　｜　教師版' if teacher else
+                    "學校 __________　____ 年 ____ 班　座號 ____　姓名 __________________")
+        doc.add_paragraph(identity).alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        doc.add_heading(source["title"], 0)
+        doc.add_paragraph(f'{source["stage"]}　｜　{source["purpose"]}　｜　' + ("教師版" if teacher else "學生版"))
+        if not teacher:
+            doc.add_paragraph("班級 __________　姓名 __________　日期 __________")
+    mode = layout.get("mode", "single")
     zones = {zone["start_item"]: zone for zone in layout_zones(source)}
     columns = 1
 
@@ -276,6 +311,7 @@ def document(source, path, assets, teacher, font_family):
         settings.set(qn("w:num"), str(count))
         settings.set(qn("w:equalWidth"), "1")
         settings.set(qn("w:space"), str(Cm(COLUMN_GAP_CM).twips))
+        settings.set(qn("w:sep"), "1" if count == 2 and layout.get("column_rule") else "0")
         columns = count
 
     for item in source["items"]:
@@ -293,22 +329,39 @@ def document(source, path, assets, teacher, font_family):
         if desired != columns:
             switch_columns(desired, page_break)
             page_break = False
-        heading = doc.add_heading(item["id"] + "　" + item.get("heading", "練習"), level=2)
+        if item.get("column_break"):
+            marker = doc.add_paragraph()
+            marker.paragraph_format.space_after = Pt(0)
+            marker.paragraph_format.line_spacing = Pt(1)
+            marker.add_run().add_break(WD_BREAK.COLUMN)
+        if item.get("group_heading"):
+            group = doc.add_heading(item["group_heading"], level=2)
+            group.paragraph_format.page_break_before = page_break
+            page_break = False
+        heading_text = item.get("heading", "練習")
+        heading = doc.add_heading(item["id"] + (f"　{heading_text}" if heading_text else ""), level=2)
         heading.paragraph_format.page_break_before = page_break
         content_cm = (17.4 - COLUMN_GAP_CM * (columns - 1)) / columns
         prompt = doc.add_paragraph(item["prompt"])
         prompt.paragraph_format.keep_together = True
+        following_answer = bool(item.get("answer") if teacher else
+                                item.get("answer_lines") or item.get("workspace_mm"))
         prompt.paragraph_format.keep_with_next = (
-            any(key in item for key in ("formula", "figure", "table"))
-            or bool(item.get("answer") if teacher else item.get("answer_lines"))
+            any(key in item for key in ("formula", "figure", "table")) or following_answer
         )
         if "formula" in item:
             math_paragraph = doc.add_paragraph()
+            math_paragraph.paragraph_format.line_spacing = 1.0
             math_paragraph._p.append(native_math(item["formula"]["parts"]))
-            math_paragraph.paragraph_format.keep_with_next = any(key in item for key in ("figure", "table"))
+            math_paragraph.paragraph_format.keep_with_next = (
+                any(key in item for key in ("figure", "table")) or following_answer
+            )
         if "figure" in item:
             picture = doc.add_picture(str(assets / (item["id"] + ".png")), width=Cm(min(13.4, content_cm)))
             picture._inline.docPr.set("descr", item["figure"]["alt"])
+            picture_format = doc.paragraphs[-1].paragraph_format
+            picture_format.line_spacing = 1.0
+            picture_format.keep_with_next = "table" in item or following_answer
         if "table" in item:
             rows = item["table"]
             table = doc.add_table(rows=0, cols=len(rows[0]))
@@ -321,10 +374,14 @@ def document(source, path, assets, teacher, font_family):
                     cell.text = str(data)
                     cell.paragraphs[0].paragraph_format.keep_with_next = (
                         row_index + 1 < len(rows)
-                        or bool(item.get("answer") if teacher else item.get("answer_lines"))
+                        or following_answer
                     )
         if teacher and item.get("answer"):
             doc.add_paragraph(item["answer"])
+        elif not teacher and item.get("workspace_mm"):
+            space = doc.add_paragraph()
+            space.paragraph_format.line_spacing = Cm(item["workspace_mm"] / 10)
+            space.paragraph_format.space_after = Pt(0)
         elif not teacher:
             answer_lines = item.get("answer_lines", 0)
             for index in range(answer_lines):
@@ -366,7 +423,8 @@ def main():
         print(font_note, file=sys.stderr)
     report = {"requested_font": requested, "selected_font": font_family,
               "local_font_confirmed": resolved, "font_note": font_note,
-              "layout_mode": layout.get("mode", "single")}
+              "layout_mode": layout.get("mode", "single"),
+              "column_rule": layout.get("column_rule", False)}
     for item in source["items"]:
         if "figure" in item:
             basename = out / item["id"]
@@ -377,7 +435,8 @@ def main():
         return
     student = {key: source[key] for key in ("version", "title", "stage", "purpose", "sources", "layout") if key in source}
     student["items"] = [{key: value for key, value in item.items() if key in (
-        "id", "heading", "prompt", "figure", "formula", "table", "answer_lines", "page_break"
+        "id", "heading", "prompt", "figure", "formula", "table", "answer_lines", "page_break",
+        "column_break", "group_heading", "workspace_mm"
     )} for item in source["items"]]
     student_file = out / "student.docx"
     teacher_file = out / "teacher.docx"
