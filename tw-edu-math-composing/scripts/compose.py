@@ -68,7 +68,66 @@ def validate_parts(parts):
             raise ValueError(f"不支援的公式結構：{kind}")
 
 
-def diagram(spec, svg_path=None, png_path=None):
+DEFAULT_FONT = "Noto Sans TC"
+COLUMN_GAP_CM = 0.8
+
+
+def resolve_font(requested, fallback):
+    """Resolve exact family names instead of accepting fontconfig's silent substitutes."""
+    matcher = shutil.which("fc-match")
+    if not matcher:
+        return requested, None, "未找到 fc-match，請開啟成品確認字型。", False
+    for family in dict.fromkeys((requested, fallback)):
+        result = subprocess.run([matcher, "-f", "%{family}\t%{file}\t%{index}", family],
+                                capture_output=True, text=True, check=False)
+        fields = result.stdout.strip().split("\t")
+        if len(fields) != 3 or not Path(fields[1]).is_file():
+            continue
+        aliases = [name.strip().casefold() for name in fields[0].split(",")]
+        if family.casefold() in aliases:
+            note = "" if family == requested else f"找不到 {requested}，改用 {family}。"
+            return family, (fields[1], int(fields[2] or 0) % 65536), note, True
+    return requested, None, f"找不到 {requested} 或 {fallback}，請確認輸出字型。", False
+
+
+def layout_zones(source):
+    settings = source.get("layout", {})
+    if not isinstance(settings, dict):
+        raise ValueError("layout 必須為物件")
+    mode = settings.get("mode", "single")
+    if mode not in ("single", "double", "mixed"):
+        raise ValueError("layout.mode 可用 single、double、mixed")
+    for key in ("font_family", "fallback_font_family"):
+        if key in settings and (not isinstance(settings[key], str) or not settings[key].strip()
+                                or any(c in settings[key] for c in "\n\r\t")):
+            raise ValueError(f"layout.{key} 必須為單行字型名稱")
+    zones = settings.get("zones", [])
+    if mode != "mixed":
+        if zones:
+            raise ValueError("layout.zones 只適用於 mixed")
+        return []
+    if not isinstance(zones, list) or not zones or not all(isinstance(zone, dict) for zone in zones):
+        raise ValueError("mixed 需要至少一個題組分區")
+    order = [item["id"] for item in source["items"]]
+    positions = []
+    for zone in zones:
+        first = zone.get("start_item")
+        if first not in order:
+            raise ValueError(f"分區起始題號不存在：{first}")
+        positions.append(order.index(first))
+        columns = zone.get("columns")
+        if type(columns) is not int or columns not in (1, 2):
+            raise ValueError("分區欄數須為 1 或 2")
+        if "title" in zone and (not isinstance(zone["title"], str) or not zone["title"].strip()):
+            raise ValueError("分區標題須為非空文字")
+    if positions[0] != 0 or positions != sorted(set(positions)):
+        raise ValueError("分區須從首題開始，依題序排列且不可重複")
+    if {zone["columns"] for zone in zones} != {1, 2}:
+        raise ValueError("mixed 須同時有一欄及兩欄分區")
+    return zones
+
+
+def diagram(spec, svg_path=None, png_path=None, font_family=DEFAULT_FONT, font_file=None):
     width, height = spec["size"]
     if not all(type(v) is int and 0 < v <= 2000 for v in (width, height)):
         raise ValueError("圖面尺寸須是 1–2000 的整數")
@@ -83,7 +142,10 @@ def diagram(spec, svg_path=None, png_path=None):
         if not font_path.is_file() and shutil.which("fc-match"):
             font_path = Path(subprocess.check_output(
                 ["fc-match", "-f", "%{file}", "DejaVu Sans"], text=True))
-        font = ImageFont.truetype(str(font_path), 38) if font_path.is_file() else ImageFont.load_default(size=38)
+        if font_file:
+            font = ImageFont.truetype(font_file[0], 38, index=font_file[1])
+        else:
+            font = ImageFont.truetype(str(font_path), 38) if font_path.is_file() else ImageFont.load_default(size=38)
 
     def draw_line(points, dashed=False):
         if len(points) < 2:
@@ -128,7 +190,7 @@ def diagram(spec, svg_path=None, png_path=None):
             values = [low + (high - low) * index / 300 for index in range(301)]
             draw_line([(ox + sx * t, oy - sy * function(t)) for t in values], curve.get("dashed", False))
     for x, y, label in spec.get("labels", []):
-        SubElement(svg, "text", x=str(x), y=str(y), **{"font-size": "13", "font-family": "sans-serif"}).text = label
+        SubElement(svg, "text", x=str(x), y=str(y), **{"font-size": "13", "font-family": f"{font_family}, sans-serif"}).text = label
         if png_path:
             canvas.text((x * 3, y * 3), label, font=font, fill="black", anchor="ls")
     if svg_path:
@@ -161,10 +223,13 @@ def validate(source):
             raise ValueError("作答行數須介於 0 到 12")
     if not ids:
         raise ValueError("教材至少須有一題")
+    layout_zones(source)
 
 
-def document(source, path, assets, teacher):
+def document(source, path, assets, teacher, font_family):
     from docx import Document
+    from docx.enum.section import WD_SECTION_START
+    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
     from docx.oxml.ns import qn
     from docx.shared import Cm, Pt, RGBColor
 
@@ -175,39 +240,98 @@ def document(source, path, assets, teacher):
     section.left_margin = section.right_margin = Cm(1.8)
     for name, size in (("Normal", 11), ("Title", 24), ("Heading 2", 13)):
         style = doc.styles[name]
-        style.font.name = "Noto Sans TC"
+        style.font.name = font_family
         fonts = style.element.get_or_add_rPr().rFonts
         for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
             fonts.attrib.pop(qn("w:" + attr), None)
-        fonts.set(qn("w:eastAsia"), "Noto Sans TC")
+        fonts.set(qn("w:eastAsia"), font_family)
         style.font.size = Pt(size)
         style.font.color.rgb = RGBColor.from_string("202020")
+    if "layout" in source:
+        normal = doc.styles["Normal"].paragraph_format
+        normal.space_after = Pt(3)
+        normal.line_spacing = Pt(15)
+        heading_style = doc.styles["Heading 2"].paragraph_format
+        heading_style.space_before = Pt(6)
+        heading_style.space_after = Pt(2)
+        heading_style.line_spacing = Pt(17)
+        grid = section._sectPr.find(qn("w:docGrid"))
+        if grid is not None:
+            section._sectPr.remove(grid)
     doc.add_heading(source["title"], 0)
     doc.add_paragraph(f'{source["stage"]}　｜　{source["purpose"]}　｜　' + ("教師版" if teacher else "學生版"))
     if not teacher:
         doc.add_paragraph("班級 __________　姓名 __________　日期 __________")
+    mode = source.get("layout", {}).get("mode", "single")
+    zones = {zone["start_item"]: zone for zone in layout_zones(source)}
+    columns = 1
+
+    def switch_columns(count, page_break=False):
+        nonlocal columns
+        if count == columns and not page_break:
+            return
+        start = WD_SECTION_START.NEW_PAGE if page_break else WD_SECTION_START.CONTINUOUS
+        section = doc.add_section(start)
+        settings = section._sectPr.find(qn("w:cols"))
+        settings.set(qn("w:num"), str(count))
+        settings.set(qn("w:equalWidth"), "1")
+        settings.set(qn("w:space"), str(Cm(COLUMN_GAP_CM).twips))
+        columns = count
+
     for item in source["items"]:
-        if item.get("page_break"):
-            doc.add_page_break()
-        doc.add_heading(item["id"] + "　" + item.get("heading", "練習"), level=2)
-        doc.add_paragraph(item["prompt"]).paragraph_format.keep_with_next = True
+        zone = zones.get(item["id"])
+        page_break = bool(item.get("page_break"))
+        desired = zone["columns"] if zone else (2 if mode == "double" else columns)
+        if zone and zone.get("title"):
+            if columns != 1 or page_break:
+                switch_columns(1, page_break)
+            heading = doc.add_heading(zone["title"], level=2)
+            if desired != 1:
+                # The heading precedes the section break, so it spans the full page.
+                heading.paragraph_format.keep_with_next = False
+            page_break = False
+        if desired != columns:
+            switch_columns(desired, page_break)
+            page_break = False
+        heading = doc.add_heading(item["id"] + "　" + item.get("heading", "練習"), level=2)
+        heading.paragraph_format.page_break_before = page_break
+        content_cm = (17.4 - COLUMN_GAP_CM * (columns - 1)) / columns
+        prompt = doc.add_paragraph(item["prompt"])
+        prompt.paragraph_format.keep_together = True
+        prompt.paragraph_format.keep_with_next = (
+            any(key in item for key in ("formula", "figure", "table"))
+            or bool(item.get("answer") if teacher else item.get("answer_lines"))
+        )
         if "formula" in item:
-            doc.add_paragraph()._p.append(native_math(item["formula"]["parts"]))
+            math_paragraph = doc.add_paragraph()
+            math_paragraph._p.append(native_math(item["formula"]["parts"]))
+            math_paragraph.paragraph_format.keep_with_next = any(key in item for key in ("figure", "table"))
         if "figure" in item:
-            picture = doc.add_picture(str(assets / (item["id"] + ".png")), width=Cm(13.4))
+            picture = doc.add_picture(str(assets / (item["id"] + ".png")), width=Cm(min(13.4, content_cm)))
             picture._inline.docPr.set("descr", item["figure"]["alt"])
         if "table" in item:
             rows = item["table"]
             table = doc.add_table(rows=0, cols=len(rows[0]))
             table.style = "Table Grid"
-            for row in rows:
+            table.autofit = False
+            for column in table.columns:
+                column.width = Cm(content_cm / len(rows[0]))
+            for row_index, row in enumerate(rows):
                 for cell, data in zip(table.add_row().cells, row):
                     cell.text = str(data)
+                    cell.paragraphs[0].paragraph_format.keep_with_next = (
+                        row_index + 1 < len(rows)
+                        or bool(item.get("answer") if teacher else item.get("answer_lines"))
+                    )
         if teacher and item.get("answer"):
             doc.add_paragraph(item["answer"])
         elif not teacher:
-            for _ in range(item.get("answer_lines", 0)):
-                doc.add_paragraph("________________________________________________________")
+            answer_lines = item.get("answer_lines", 0)
+            for index in range(answer_lines):
+                paragraph = doc.add_paragraph("\t")
+                paragraph.paragraph_format.keep_with_next = index + 1 < answer_lines
+                paragraph.paragraph_format.tab_stops.add_tab_stop(
+                    Cm(content_cm - 0.2), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.LINES)
     doc.save(path)
 
 
@@ -234,21 +358,31 @@ def main():
     if out.exists() and any(out.iterdir()):
         parser.error("請指定空白輸出目錄")
     out.mkdir(parents=True, exist_ok=True)
+    layout = source.get("layout", {})
+    requested = layout.get("font_family", DEFAULT_FONT).strip()
+    fallback = layout.get("fallback_font_family", DEFAULT_FONT).strip()
+    font_family, font_file, font_note, resolved = resolve_font(requested, fallback)
+    if font_note:
+        print(font_note, file=sys.stderr)
+    report = {"requested_font": requested, "selected_font": font_family,
+              "local_font_confirmed": resolved, "font_note": font_note,
+              "layout_mode": layout.get("mode", "single")}
     for item in source["items"]:
         if "figure" in item:
             basename = out / item["id"]
             diagram(item["figure"], basename.with_suffix(".svg"),
-                    None if args.figures_only else basename.with_suffix(".png"))
+                    None if args.figures_only else basename.with_suffix(".png"), font_family, font_file)
     if args.figures_only:
+        (out / "render-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         return
-    student = {key: source[key] for key in ("version", "title", "stage", "purpose", "sources") if key in source}
+    student = {key: source[key] for key in ("version", "title", "stage", "purpose", "sources", "layout") if key in source}
     student["items"] = [{key: value for key, value in item.items() if key in (
         "id", "heading", "prompt", "figure", "formula", "table", "answer_lines", "page_break"
     )} for item in source["items"]]
     student_file = out / "student.docx"
     teacher_file = out / "teacher.docx"
-    document(student, student_file, out, False)
-    document(source, teacher_file, out, True)
+    document(student, student_file, out, False, font_family)
+    document(source, teacher_file, out, True, font_family)
     (out / "student-source.json").write_text(json.dumps(student, ensure_ascii=False, indent=2) + "\n",
                                                encoding="utf-8")
     if soffice:
@@ -269,6 +403,17 @@ def main():
         for name in ("student.pdf", "teacher.pdf"):
             if not (out / name).is_file():
                 raise RuntimeError(f"未產生 {name}")
+        font_inspector = shutil.which("pdffonts")
+        if font_inspector:
+            report["pdf_fonts"] = {}
+            for name in ("student.pdf", "teacher.pdf"):
+                audit = subprocess.run([font_inspector, str(out / name)], capture_output=True, text=True)
+                if audit.returncode != 0:
+                    report["pdf_fonts"][name] = "無法讀取字型資訊"
+                else:
+                    report["pdf_fonts"][name] = audit.stdout.splitlines()[2:]
+    (out / "render-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+
 
 
 if __name__ == "__main__":
