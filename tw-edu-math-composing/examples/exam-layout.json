@@ -26,9 +26,16 @@
     {
       "id": "A1",
       "heading": "正負數",
-      "prompt": "計算 −7＋12。",
+      "prompt": "計算下列算式。",
       "answer": "解答｜5",
-      "answer_lines": 1
+      "answer_lines": 1,
+      "formula": {
+        "latex": "-7+12",
+        "parts": [
+          "−7+12"
+        ],
+        "answer_blank": true
+      }
     },
     {
       "id": "A2",
@@ -40,9 +47,16 @@
     {
       "id": "A3",
       "heading": "整數運算",
-      "prompt": "計算 −4×6。",
+      "prompt": "計算下列算式。",
       "answer": "解答｜−24",
-      "answer_lines": 1
+      "answer_lines": 1,
+      "formula": {
+        "latex": "-4\\times 6",
+        "parts": [
+          "−4×6"
+        ],
+        "answer_blank": true
+      }
     },
     {
       "id": "A4",

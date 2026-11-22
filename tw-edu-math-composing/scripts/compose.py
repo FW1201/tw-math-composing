@@ -104,6 +104,10 @@ def layout_zones(source):
     for key in ("column_rule", "exam_header"):
         if key in settings and type(settings[key]) is not bool:
             raise ValueError(f"layout.{key} 須為布林值")
+    if "question_gap_pt" in settings:
+        gap = settings["question_gap_pt"]
+        if type(gap) is not int or not 0 <= gap <= 30:
+            raise ValueError("layout.question_gap_pt 須為 0 至 30 點的整數")
     zones = settings.get("zones", [])
     if mode != "mixed":
         if zones:
@@ -215,7 +219,14 @@ def validate(source):
         if "formula" in item:
             if not item["formula"]["latex"]:
                 raise ValueError("缺少 LaTeX 原文")
-            validate_parts(item["formula"]["parts"])
+            formula = item["formula"]
+            validate_parts(formula["parts"])
+            if "answer_blank" in formula and type(formula["answer_blank"]) is not bool:
+                raise ValueError("formula.answer_blank 須為布林值")
+            if formula.get("answer_blank"):
+                tail = formula["parts"][-1]
+                if isinstance(tail, str) and tail.rstrip().endswith(("=", "＝")):
+                    raise ValueError("answer_blank 會補等號，公式末尾請省略等號")
         if "figure" in item:
             diagram(item["figure"])
         if "table" in item:
@@ -258,7 +269,10 @@ def document(source, path, assets, teacher, font_family):
     section.page_width, section.page_height = Cm(21), Cm(29.7)
     section.top_margin = section.bottom_margin = Cm(1.6)
     section.left_margin = section.right_margin = Cm(1.8)
-    for name, size in (("Normal", 11), ("Title", 24), ("Heading 2", 13)):
+    layout = source.get("layout", {})
+    exam_header = layout.get("exam_header", False)
+    sizes = (10.5, 15, 11) if exam_header else (11, 24, 13)
+    for name, size in zip(("Normal", "Title", "Heading 2"), sizes):
         style = doc.styles[name]
         style.font.name = font_family
         fonts = style.element.get_or_add_rPr().rFonts
@@ -278,8 +292,7 @@ def document(source, path, assets, teacher, font_family):
         grid = section._sectPr.find(qn("w:docGrid"))
         if grid is not None:
             section._sectPr.remove(grid)
-    layout = source.get("layout", {})
-    if layout.get("exam_header"):
+    if exam_header:
         title = doc.add_heading(source["title"], 0)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         border = OxmlElement("w:pBdr")
@@ -287,8 +300,6 @@ def document(source, path, assets, teacher, font_family):
         bottom.set(qn("w:val"), "nil")
         border.append(bottom)
         title._p.get_or_add_pPr().append(border)
-        for run in title.runs:
-            run.font.size = Pt(18)
         identity = (f'{source["stage"]}　｜　教師版' if teacher else
                     "學校 __________　____ 年 ____ 班　座號 ____　姓名 __________________")
         doc.add_paragraph(identity).alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -300,6 +311,7 @@ def document(source, path, assets, teacher, font_family):
     mode = layout.get("mode", "single")
     zones = {zone["start_item"]: zone for zone in layout_zones(source)}
     columns = 1
+    question_gap = layout.get("question_gap_pt", 10 if exam_header else 8)
 
     def switch_columns(count, page_break=False):
         nonlocal columns
@@ -314,8 +326,9 @@ def document(source, path, assets, teacher, font_family):
         settings.set(qn("w:sep"), "1" if count == 2 and layout.get("column_rule") else "0")
         columns = count
 
-    for item in source["items"]:
+    for index, item in enumerate(source["items"]):
         zone = zones.get(item["id"])
+        separate = index > 0 and not (zone or item.get("column_break") or item.get("page_break"))
         page_break = bool(item.get("page_break"))
         desired = zone["columns"] if zone else (2 if mode == "double" else columns)
         if zone and zone.get("title"):
@@ -337,10 +350,17 @@ def document(source, path, assets, teacher, font_family):
         if item.get("group_heading"):
             group = doc.add_heading(item["group_heading"], level=2)
             group.paragraph_format.page_break_before = page_break
+            if separate:
+                group.paragraph_format.space_before = Pt(question_gap)
+            if exam_header:
+                for run in group.runs:
+                    run.font.size = Pt(11.5)
             page_break = False
         heading_text = item.get("heading", "練習")
         heading = doc.add_heading(item["id"] + (f"　{heading_text}" if heading_text else ""), level=2)
         heading.paragraph_format.page_break_before = page_break
+        if separate and not item.get("group_heading"):
+            heading.paragraph_format.space_before = Pt(question_gap)
         content_cm = (17.4 - COLUMN_GAP_CM * (columns - 1)) / columns
         prompt = doc.add_paragraph(item["prompt"])
         prompt.paragraph_format.keep_together = True
@@ -352,7 +372,11 @@ def document(source, path, assets, teacher, font_family):
         if "formula" in item:
             math_paragraph = doc.add_paragraph()
             math_paragraph.paragraph_format.line_spacing = 1.0
-            math_paragraph._p.append(native_math(item["formula"]["parts"]))
+            formula = item["formula"]
+            parts = formula["parts"] + ([" ="] if formula.get("answer_blank") else [])
+            math_paragraph._p.append(native_math(parts))
+            if formula.get("answer_blank"):
+                math_paragraph.add_run(" ________")
             math_paragraph.paragraph_format.keep_with_next = (
                 any(key in item for key in ("figure", "table")) or following_answer
             )
@@ -424,7 +448,8 @@ def main():
     report = {"requested_font": requested, "selected_font": font_family,
               "local_font_confirmed": resolved, "font_note": font_note,
               "layout_mode": layout.get("mode", "single"),
-              "column_rule": layout.get("column_rule", False)}
+              "column_rule": layout.get("column_rule", False),
+              "question_gap_pt": layout.get("question_gap_pt", 10 if layout.get("exam_header") else 8)}
     for item in source["items"]:
         if "figure" in item:
             basename = out / item["id"]
